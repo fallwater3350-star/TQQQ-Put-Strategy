@@ -5,7 +5,7 @@ import yfinance as yf
 import streamlit as st
 
 
-# ---------- helpers ----------
+# ----------------- Helpers -----------------
 def _to_date(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
@@ -23,8 +23,9 @@ def option_mark_mid_or_last(bid, ask, last):
 
 def put_sell_price_conservative_or_fallback(row: pd.Series) -> float:
     """
-    卖 put 的更保守成交价：优先用 bid（你更可能按 bid 成交），
-    若 bid 不可用则回退 mid/last。
+    卖 put 的更保守成交价：
+      1) 优先 bid（更贴近你能卖到的价格）
+      2) bid 不可用则回退 mid/last
     """
     bid = row.get("bid")
     if pd.notna(bid) and bid > 0:
@@ -33,6 +34,7 @@ def put_sell_price_conservative_or_fallback(row: pd.Series) -> float:
 
 def get_underlying_price(t: yf.Ticker) -> float:
     """标的当前价/最后价：多重兜底"""
+    # 1) fast_info last_price（常见可用）
     try:
         fi = getattr(t, "fast_info", None)
         if fi and fi.get("last_price"):
@@ -40,6 +42,7 @@ def get_underlying_price(t: yf.Ticker) -> float:
     except Exception:
         pass
 
+    # 2) 1m 最后一根
     try:
         h = t.history(period="1d", interval="1m")
         if not h.empty and pd.notna(h["Close"].iloc[-1]):
@@ -47,6 +50,7 @@ def get_underlying_price(t: yf.Ticker) -> float:
     except Exception:
         pass
 
+    # 3) 5d 最后一根日线 close
     try:
         h = t.history(period="5d", interval="1d")
         if not h.empty and pd.notna(h["Close"].iloc[-1]):
@@ -56,52 +60,87 @@ def get_underlying_price(t: yf.Ticker) -> float:
 
     return float("nan")
 
+def fmt_pct(x):
+    """把 0.2345 显示成 23.45%"""
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return ""
+    return f"{x*100:.2f}%"
 
-def scan_cash_or_margin_secured_puts(
+
+# ----------------- Core Scan -----------------
+def scan_puts_ws_margin_rule(
     symbol: str,
     min_dte: int,
     max_dte: int,
-    strike_min: float | None = None,
-    strike_max: float | None = None,
-    min_annualized: float | None = None,
-) -> pd.DataFrame:
+    underlying_px: float,
+    otm_pct: float | None,
+    strike_min: float | None,
+    strike_max: float | None,
+    top_n_per_expiry: int,
+    min_annualized: float | None,
+) -> tuple[pd.DataFrame, dict]:
     """
-    扫描指定 DTE 区间内的 put，按 Wealthsimple 保证金口径计算年化：
+    扫描指定 DTE 区间内的 puts，按 Wealthsimple 保证金口径计算年化：
       margin_per_share = strike - premium
-      annualized = (premium / margin) * (365 / dte)
+      annualized = (premium_$ / margin_$) * (365 / dte)
 
-    premium 使用：优先 bid（保守卖出价），否则回退 mid/last。
+    其中 premium 用：优先 bid（保守卖出价），否则回退 mid/last。
+    并支持：
+      - 按现价 OTM% 自动生成 strike 上限
+      - 按到期日分组，每个到期日 Top N
     """
     t = yf.Ticker(symbol)
     expirations = list(t.options) or []
-    rows = []
 
+    meta = {
+        "computed_strike_cap_from_otm": None,
+        "underlying_px": underlying_px,
+        "total_rows_before_grouping": 0,
+        "total_rows_after_grouping": 0,
+    }
+
+    # 根据 OTM% 计算 strike cap（上限）
+    strike_cap = None
+    if otm_pct is not None and pd.notna(underlying_px) and underlying_px > 0:
+        strike_cap = underlying_px * (1.0 - otm_pct)
+        meta["computed_strike_cap_from_otm"] = strike_cap
+
+    rows = []
     for exp in expirations:
         dte = _dte(exp)
         if dte < min_dte or dte > max_dte:
             continue
 
-        chain = t.option_chain(exp)
+        try:
+            chain = t.option_chain(exp)
+        except Exception:
+            continue
+
         puts = chain.puts.copy()
         if puts.empty:
             continue
 
-        # strike 过滤
+        # strike filters (manual)
         if strike_min is not None:
             puts = puts.loc[puts["strike"] >= float(strike_min)]
         if strike_max is not None:
             puts = puts.loc[puts["strike"] <= float(strike_max)]
+
+        # strike filter (OTM cap)
+        if strike_cap is not None:
+            puts = puts.loc[puts["strike"] <= float(strike_cap)]
+
         if puts.empty:
             continue
 
         for _, r in puts.iterrows():
             strike = float(r["strike"])
-            premium_per_share = put_sell_price_conservative_or_fallback(r)
 
+            premium_per_share = put_sell_price_conservative_or_fallback(r)
             if not (pd.notna(premium_per_share) and premium_per_share > 0):
                 continue
 
-            # Wealthsimple margin per share (你提供的规则)
+            # WS margin per share (你提供的规则)
             margin_per_share = strike - premium_per_share
             if margin_per_share <= 0:
                 continue
@@ -120,7 +159,7 @@ def scan_cash_or_margin_secured_puts(
                 "dte": dte,
                 "strike": strike,
 
-                # raw quotes
+                # quotes
                 "bid": r.get("bid"),
                 "ask": r.get("ask"),
                 "lastPrice": r.get("lastPrice"),
@@ -134,63 +173,125 @@ def scan_cash_or_margin_secured_puts(
                 "margin_$": margin_dollars,
 
                 "annualized": ann,
-                "inTheMoney": r.get("inTheMoney"),
-                "openInterest": r.get("openInterest"),
                 "volume": r.get("volume"),
+                "openInterest": r.get("openInterest"),
                 "impliedVolatility": r.get("impliedVolatility"),
+                "inTheMoney": r.get("inTheMoney"),
             })
 
     out = pd.DataFrame(rows)
+    meta["total_rows_before_grouping"] = len(out)
+
     if out.empty:
-        return out
+        return out, meta
 
+    # Top N per expiry (按年化降序，权利金其次)
+    top_n = max(int(top_n_per_expiry), 1)
+    out = out.sort_values(["expiration", "annualized", "premium_$"], ascending=[True, False, False])
+    out = out.groupby("expiration", as_index=False, group_keys=False).head(top_n)
+
+    # 最终整体也按年化排序，方便一眼看最强
     out = out.sort_values(["annualized", "premium_$"], ascending=[False, False]).reset_index(drop=True)
-    return out
+
+    meta["total_rows_after_grouping"] = len(out)
+    return out, meta
 
 
-# ---------- UI ----------
-st.set_page_config(page_title="TQQQ Put Annualized Scanner (Wealthsimple Margin Rule)", layout="wide")
+# ----------------- UI -----------------
+st.set_page_config(page_title="TQQQ Put Annualized Scanner (WS Margin Rule)", layout="wide")
 st.title("TQQQ 卖 Put 年化收益率扫描器（按 Wealthsimple 保证金口径）")
 
+# Sidebar controls
 symbol = st.sidebar.text_input("Symbol", value="TQQQ").upper()
+
+st.sidebar.markdown("### 到期日区间（DTE）")
 min_dte = st.sidebar.slider("最小 DTE", 1, 180, 7)
 max_dte = st.sidebar.slider("最大 DTE", 1, 365, 30)
 
-st.sidebar.markdown("### Strike 过滤（可选）")
-strike_min = st.sidebar.number_input("Strike Min", value=0.0, step=1.0)
-strike_max = st.sidebar.number_input("Strike Max（0 表示不限制）", value=0.0, step=1.0)
+st.sidebar.markdown("### OTM 过滤（按现价自动算 strike 上限）")
+use_otm = st.sidebar.checkbox("启用 OTM% 过滤", value=True)
+otm_pct = None
+if use_otm:
+    otm_pct = st.sidebar.slider("OTM%", 0.0, 0.6, 0.10, 0.01)  # 0.10 = 10% OTM
+
+st.sidebar.markdown("### Strike 手动过滤（可选）")
+strike_min_in = st.sidebar.number_input("Strike Min（0 表示不限制）", value=0.0, step=1.0)
+strike_max_in = st.sidebar.number_input("Strike Max（0 表示不限制）", value=0.0, step=1.0)
+
+st.sidebar.markdown("### 每个到期日 Top N")
+top_n = st.sidebar.slider("Top N per Expiration", 1, 50, 10)
 
 st.sidebar.markdown("### 年化过滤（可选）")
-min_ann = st.sidebar.number_input("Min Annualized（例如 0.20=20%）", value=0.0, step=0.01)
+min_ann_in = st.sidebar.number_input("Min Annualized（例如 0.20=20%）", value=0.0, step=0.01)
 
 run = st.sidebar.button("运行扫描")
 
+# Fetch underlying price and show
 t = yf.Ticker(symbol)
-px = get_underlying_price(t)
-st.metric(label=f"{symbol} 当前/最后价格", value=("N/A" if math.isnan(px) else f"{px:.2f}"))
+underlying_px = get_underlying_price(t)
 
-st.caption(
-    "定价规则：卖 put 优先用 bid（更保守）；若 bid 不可用则回退 mid/lastPrice。"
-    "年化按你给的 Wealthsimple 保证金口径：margin = K - premium。"
-)
+c1, c2 = st.columns([1, 3])
+with c1:
+    st.metric(label=f"{symbol} 当前/最后价格", value=("N/A" if math.isnan(underlying_px) else f"{underlying_px:.2f}"))
+with c2:
+    st.caption(
+        "卖 put 定价：优先用 bid（更保守）；若 bid 不可用则回退 mid/lastPrice。"
+        " 保证金口径（Wealthsimple）：margin = Strike - premium。"
+    )
 
+# Run scan
 if run:
-    df = scan_cash_or_margin_secured_puts(
+    strike_min = None if strike_min_in <= 0 else float(strike_min_in)
+    strike_max = None if strike_max_in <= 0 else float(strike_max_in)
+    min_ann = None if min_ann_in <= 0 else float(min_ann_in)
+
+    df, meta = scan_puts_ws_margin_rule(
         symbol=symbol,
         min_dte=min_dte,
         max_dte=max_dte,
-        strike_min=(None if strike_min <= 0 else strike_min),
-        strike_max=(None if strike_max <= 0 else strike_max),
-        min_annualized=(None if min_ann <= 0 else min_ann),
+        underlying_px=underlying_px,
+        otm_pct=otm_pct,
+        strike_min=strike_min,
+        strike_max=strike_max,
+        top_n_per_expiry=top_n,
+        min_annualized=min_ann,
+    )
+
+    # show filters summary
+    if otm_pct is not None and meta.get("computed_strike_cap_from_otm") is not None:
+        st.info(
+            f"OTM% 过滤启用：OTM={otm_pct*100:.0f}% → strike ≤ 现价×(1-OTM) = {meta['computed_strike_cap_from_otm']:.2f}"
+        )
+
+    st.caption(
+        f"扫描结果：分组前 {meta['total_rows_before_grouping']} 条；按到期日 Top {top_n} 后 {meta['total_rows_after_grouping']} 条。"
     )
 
     if df.empty:
-        st.warning("没有扫描到结果：可能是 DTE/strike 过滤太严格，或 Yahoo 数据暂时缺失。")
+        st.warning("没有扫描到结果：可能是 DTE/OTM/strike 过滤太严格，或 Yahoo 数据暂时缺失。")
     else:
-        st.dataframe(df, use_container_width=True)
+        # Display: annualized as percent
+        show = df.copy()
+        show["annualized(%)"] = show["annualized"].apply(fmt_pct)
+
+        # 你常看字段放前面
+        cols_order = [
+            "expiration", "dte", "strike",
+            "annualized(%)", "premium_$", "margin_$",
+            "premium_used_per_share", "margin_per_share_(K-premium)",
+            "bid", "ask", "lastPrice",
+            "volume", "openInterest", "impliedVolatility", "inTheMoney",
+        ]
+        cols_order = [c for c in cols_order if c in show.columns]
+        show = show[cols_order]
+
+        st.dataframe(show, use_container_width=True)
+
         st.download_button(
-            "下载 CSV",
+            "下载 CSV（含 annualized 原始小数）",
             data=df.to_csv(index=False).encode("utf-8"),
             file_name=f"{symbol}_put_annualized_scan.csv",
             mime="text/csv",
         )
+else:
+    st.caption("设置参数后点击左侧「运行扫描」。")
